@@ -1,0 +1,1 @@
+worker: python Nifty_Roll_SS_spot.py
