@@ -1,1 +1,1 @@
-worker: python Nifty_Roll_SS_spot.py
+worker: python Nifty_Strangle_spot.py
