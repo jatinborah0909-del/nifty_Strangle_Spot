@@ -17,6 +17,7 @@ DB
 • Single table: nifty_intraday_strangle_spot
 • Stores ENTRY / EXIT / OPEN_NEW / SNAPSHOT / ERROR
 • EXIT rows store CE & PE exit prices (FIXED)
+• ✅ PnL FIX: EXIT rows no longer double-count unrealized PnL
 """
 
 # =====================================================
@@ -86,7 +87,7 @@ kite.set_access_token(ACCESS_TOKEN)
 # =====================================================
 
 def db():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
     with db() as con:
@@ -178,7 +179,7 @@ def get_ltp(sym):
 
 def load_weekly_option_map():
     df = pd.DataFrame(kite.instruments(EXCH_OPT))
-    df = df[(df["name"] == UNDERLYING) & (df["instrument_type"].isin(["CE","PE"]))]
+    df = df[(df["name"] == UNDERLYING) & (df["instrument_type"].isin(["CE","PE"]))].copy()
     df["expiry"] = pd.to_datetime(df["expiry"]).dt.normalize()
 
     exp = df[df["expiry"] >= pd.Timestamp.now().normalize()]["expiry"].min()
@@ -211,10 +212,14 @@ state = {
 }
 
 # =====================================================
-# LOGGING
+# LOGGING / PNL
 # =====================================================
 
 def calc_pnl(ce_ltp=None, pe_ltp=None):
+    """
+    Returns (unreal, realized, total) for CURRENT OPEN position.
+    If no open position, unreal=None and total=realized.
+    """
     if not state["has_position"]:
         return None, state["realized_pnl"], state["realized_pnl"]
 
@@ -225,8 +230,19 @@ def calc_pnl(ce_ltp=None, pe_ltp=None):
     total  = unreal + state["realized_pnl"]
     return unreal, state["realized_pnl"], total
 
-def log_event(event, reason, status=None, ce_exit=None, pe_exit=None, extra=None):
-    unreal, realized, total = calc_pnl()
+def log_event(event, reason, status=None, ce_exit=None, pe_exit=None, extra=None, is_exit=False):
+    """
+    ✅ FIX:
+    - On EXIT rows, do NOT compute unreal PnL from old legs (avoids double counting).
+      For EXIT rows: unreal=0, total=realized (after realized has been updated).
+    - For non-EXIT rows: total = realized + unreal (if open).
+    """
+    if is_exit:
+        unreal = 0
+        realized = state["realized_pnl"]
+        total = realized
+    else:
+        unreal, realized, total = calc_pnl()
 
     insert_row({
         "bot_name": BOT_NAME,
@@ -243,6 +259,7 @@ def log_event(event, reason, status=None, ce_exit=None, pe_exit=None, extra=None
 
         "ce_entry": state["ce_entry"],
         "pe_entry": state["pe_entry"],
+
         "ce_exit": ce_exit,
         "pe_exit": pe_exit,
 
@@ -286,6 +303,9 @@ def log_snapshot():
         "realized_pnl": realized,
         "total_pnl": total,
 
+        "adjust_dir": state["last_adjust_dir"],
+        "last_adjust_spot": state["last_adjust_spot"],
+
         "extra": Json({})
     })
 
@@ -294,8 +314,10 @@ def log_snapshot():
 # =====================================================
 
 def threat_dir(spot):
+    # Threat on CE side: spot approaching CE strike from below
     if (state["ce"] - spot) <= MIN_THRESHOLD:
         return "UP"
+    # Threat on PE side: spot approaching PE strike from above
     if (spot - state["pe"]) <= MIN_THRESHOLD:
         return "DOWN"
     return None
@@ -331,14 +353,19 @@ def main():
                 ce = atm + INITIAL_OFFSET
                 pe = atm - INITIAL_OFFSET
 
+                ce_sym = opt_map.get((ce, "CE"))
+                pe_sym = opt_map.get((pe, "PE"))
+                if not ce_sym or not pe_sym:
+                    raise RuntimeError(f"Option symbol not found for strikes: CE={ce}, PE={pe}")
+
                 state.update({
                     "has_position": True,
                     "ce": ce,
                     "pe": pe,
-                    "ce_sym": opt_map[(ce, "CE")],
-                    "pe_sym": opt_map[(pe, "PE")],
-                    "ce_entry": get_ltp(opt_map[(ce, "CE")]),
-                    "pe_entry": get_ltp(opt_map[(pe, "PE")]),
+                    "ce_sym": ce_sym,
+                    "pe_sym": pe_sym,
+                    "ce_entry": get_ltp(ce_sym),
+                    "pe_entry": get_ltp(pe_sym),
                     "last_roll_ts": time.time()
                 })
 
@@ -348,6 +375,7 @@ def main():
             if state["has_position"] and time.time() - state["last_roll_ts"] >= ROLL_COOLDOWN_SEC:
                 d = threat_dir(spot)
                 if d and can_adjust(spot, d):
+                    # exit old legs
                     ce_exit = get_ltp(state["ce_sym"])
                     pe_exit = get_ltp(state["pe_sym"])
 
@@ -355,10 +383,18 @@ def main():
                              (state["pe_entry"] - pe_exit)) * QTY_PER_LEG
                     state["realized_pnl"] += delta
 
-                    log_event("EXIT", f"THREAT_{d}", "EXITING",
-                              ce_exit=ce_exit, pe_exit=pe_exit,
-                              extra={"delta": delta})
+                    # ✅ FIX: EXIT rows should not include unreal from the exited legs
+                    log_event(
+                        "EXIT",
+                        f"THREAT_{d}",
+                        "EXITING",
+                        ce_exit=ce_exit,
+                        pe_exit=pe_exit,
+                        extra={"delta": delta},
+                        is_exit=True
+                    )
 
+                    # compute new strikes
                     if d == "UP":
                         new_ce = state["ce"] + LOSS_PUSH_DIST
                         new_pe = new_ce - MAX_STRANGLE_WIDTH
@@ -366,13 +402,19 @@ def main():
                         new_pe = state["pe"] - LOSS_PUSH_DIST
                         new_ce = new_pe + MAX_STRANGLE_WIDTH
 
+                    new_ce_sym = opt_map.get((new_ce, "CE"))
+                    new_pe_sym = opt_map.get((new_pe, "PE"))
+                    if not new_ce_sym or not new_pe_sym:
+                        raise RuntimeError(f"Option symbol not found for new strikes: CE={new_ce}, PE={new_pe}")
+
+                    # open new legs
                     state.update({
                         "ce": new_ce,
                         "pe": new_pe,
-                        "ce_sym": opt_map[(new_ce, "CE")],
-                        "pe_sym": opt_map[(new_pe, "PE")],
-                        "ce_entry": get_ltp(opt_map[(new_ce, "CE")]),
-                        "pe_entry": get_ltp(opt_map[(new_pe, "PE")]),
+                        "ce_sym": new_ce_sym,
+                        "pe_sym": new_pe_sym,
+                        "ce_entry": get_ltp(new_ce_sym),
+                        "pe_entry": get_ltp(new_pe_sym),
                         "last_adjust_spot": spot,
                         "last_adjust_dir": d,
                         "last_roll_ts": time.time()
@@ -388,7 +430,10 @@ def main():
             time.sleep(TICK_INTERVAL)
 
         except Exception as e:
-            log_event("ERROR", "EXCEPTION", "ERROR", extra={"error": str(e)})
+            try:
+                log_event("ERROR", "EXCEPTION", "ERROR", extra={"error": str(e)})
+            except Exception:
+                pass
             print("[ERROR]", e)
             time.sleep(2)
 
