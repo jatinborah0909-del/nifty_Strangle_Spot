@@ -23,6 +23,11 @@ UPGRADES (Option B)
 ✅ Forced square-off at 15:25
 ✅ Optional PROFIT_TARGET and CIRCUIT_STOP_LOSS (env)
 ✅ Keeps PnL FIX: EXIT rows do not double-count unrealized
+
+NEW (this update)
+-----------------
+✅ EXPIRY_MODE env var: 'cw' (current week) or 'nw' (next week)
+✅ Adjust block fixed: ladder-push from OLD strikes (no ATM re-anchor)
 """
 
 # =====================================================
@@ -74,6 +79,11 @@ ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 TABLE = os.getenv("TABLE", "nifty_intraday_strangle_spot").strip()
+
+# ✅ NEW: expiry mode (cw/nw)
+EXPIRY_MODE = os.getenv("EXPIRY_MODE", "cw").lower().strip()
+if EXPIRY_MODE not in ("cw", "nw"):
+    raise SystemExit("❌ EXPIRY_MODE must be 'cw' or 'nw'")
 
 # Kill-switch (READ ONLY)
 FLAG_TABLE = os.getenv("FLAG_TABLE", "trade_flag").strip()
@@ -270,7 +280,7 @@ def stocko_place(tradingsymbol: str, side: str, qty: int, offset=0, retries=2):
     raise RuntimeError(last_err or "Stocko order failed (unknown)")
 
 # =====================================================
-# OPTION MAP
+# OPTION MAP (CW / NW)
 # =====================================================
 
 def load_weekly_option_map():
@@ -278,10 +288,22 @@ def load_weekly_option_map():
     df = df[(df["name"] == UNDERLYING) & (df["instrument_type"].isin(["CE","PE"]))].copy()
     df["expiry"] = pd.to_datetime(df["expiry"]).dt.normalize()
 
-    exp = df[df["expiry"] >= pd.Timestamp.now().normalize()]["expiry"].min()
+    today = pd.Timestamp.now().normalize()
+    expiries = sorted(df[df["expiry"] >= today]["expiry"].unique())
+
+    if not expiries:
+        raise RuntimeError("No valid future expiries found for the underlying in NFO instruments.")
+
+    if EXPIRY_MODE == "cw":
+        exp = expiries[0]
+    else:  # "nw"
+        if len(expiries) < 2:
+            raise RuntimeError("Next-week expiry not available (need at least 2 future expiries).")
+        exp = expiries[1]
+
     df = df[df["expiry"] == exp]
 
-    print(f"[CONFIG] Weekly expiry: {exp.date()}")
+    print(f"[CONFIG] EXPIRY_MODE={EXPIRY_MODE.upper()} | Weekly expiry: {pd.Timestamp(exp).date()}")
     return {(int(r.strike), r.instrument_type): r.tradingsymbol for _, r in df.iterrows()}
 
 # =====================================================
@@ -528,7 +550,7 @@ def main():
 
     last_snap = 0
     print("[START] Threat-based NIFTY short strangle (NO STATE TABLE)")
-    print(f"[MODE] LIVE_MODE={LIVE_MODE} | FLAG={FLAG_TABLE}.{FLAG_COL} | SQUARE_OFF={SQUARE_OFF_TIME.strftime('%H:%M')}")
+    print(f"[MODE] LIVE_MODE={LIVE_MODE} | EXPIRY_MODE={EXPIRY_MODE.upper()} | FLAG={FLAG_TABLE}.{FLAG_COL} | SQUARE_OFF={SQUARE_OFF_TIME.strftime('%H:%M')}")
     print(f"[RISK] PROFIT_TARGET={PROFIT_TARGET} | CIRCUIT_STOP_LOSS={CIRCUIT_STOP_LOSS}")
 
     while True:
@@ -624,14 +646,23 @@ def main():
                     "last_roll_ts": time.time()
                 })
 
-                log_event("ENTRY", "ENTRY_ATM±OFFSET", "OPEN", extra={"orders": orders})
+                log_event("ENTRY", "ENTRY_ATM±OFFSET", "OPEN", extra={"orders": orders, "expiry_mode": EXPIRY_MODE})
 
             # -------------------------------------------------
-            # ADJUST
+            # ADJUST (FIXED: ladder push from OLD strikes)
             # -------------------------------------------------
             if state["has_position"] and time.time() - state["last_roll_ts"] >= ROLL_COOLDOWN_SEC:
                 d = threat_dir(spot)
                 if d and can_adjust(spot, d):
+
+                    # ✅ capture OLD strikes BEFORE exit clears them
+                    old_ce = state["ce"]
+                    old_pe = state["pe"]
+                    if old_ce is None or old_pe is None:
+                        log_event("SKIP_ADJ", "INVALID_STATE", "SKIPPED", extra={"d": d})
+                        time.sleep(TICK_INTERVAL)
+                        continue
+
                     # 1) Exit old legs (BUY to close) and log EXIT properly
                     safe_exit_all(f"THREAT_{d}", "ADJ_EXIT")
 
@@ -642,15 +673,12 @@ def main():
                         time.sleep(TICK_INTERVAL)
                         continue
 
-                    # 2) Compute new strikes
+                    # 2) Compute new strikes (PURE ladder push)
                     if d == "UP":
-                        new_ce = (nearest_strike(spot) + INITIAL_OFFSET)  # keep consistent behavior: shift up logic via LOSS_PUSH_DIST below
-                        # Original adjust logic:
-                        new_ce = (new_ce if state["ce"] is None else (state["ce"] + LOSS_PUSH_DIST))
+                        new_ce = old_ce + LOSS_PUSH_DIST
                         new_pe = new_ce - MAX_STRANGLE_WIDTH
-                    else:
-                        new_pe = (nearest_strike(spot) - INITIAL_OFFSET)
-                        new_pe = (new_pe if state["pe"] is None else (state["pe"] - LOSS_PUSH_DIST))
+                    else:  # DOWN
+                        new_pe = old_pe - LOSS_PUSH_DIST
                         new_ce = new_pe + MAX_STRANGLE_WIDTH
 
                     new_ce_sym = opt_map.get((new_ce, "CE"))
@@ -675,7 +703,8 @@ def main():
                         "last_roll_ts": time.time()
                     })
 
-                    log_event("OPEN_NEW", f"ADJ_{d}", "OPEN", extra={"orders": orders})
+                    log_event("OPEN_NEW", f"ADJ_{d}", "OPEN",
+                              extra={"orders": orders, "old_ce": old_ce, "old_pe": old_pe, "expiry_mode": EXPIRY_MODE})
 
             time.sleep(TICK_INTERVAL)
 
